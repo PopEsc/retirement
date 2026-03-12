@@ -16,12 +16,67 @@ filled from the proxy.
 from __future__ import annotations
 
 import io
+import json
+import time
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+
+
+# ---------------------------------------------------------------------------
+# Disk cache
+# ---------------------------------------------------------------------------
+
+# Cache lives next to the project root (one level up from this package dir)
+_CACHE_DIR = Path(__file__).parent.parent / ".market_cache"
+# Re-fetch data that includes the current or previous year after 24 hours.
+# Purely historical ranges (end_year < current_year - 1) are cached forever.
+_CACHE_TTL_SECONDS = 86_400  # 24 hours
+
+
+def _cache_path(key: str) -> Path:
+    _CACHE_DIR.mkdir(exist_ok=True)
+    return _CACHE_DIR / f"{key}.json"
+
+
+def _load_cached_series(key: str, end_year: int) -> pd.Series | None:
+    path = _cache_path(key)
+    if not path.exists():
+        return None
+    try:
+        with path.open() as f:
+            cached = json.load(f)
+        # Apply TTL only when the requested range includes recent data
+        if end_year >= datetime.now().year - 1:
+            age = time.time() - float(cached.get("fetched_at", 0))
+            if age > _CACHE_TTL_SECONDS:
+                return None
+        series = pd.Series(
+            {int(k): float(v) for k, v in cached["data"].items()}
+        )
+        series.index = series.index.astype(int)
+        return series
+    except Exception:
+        return None
+
+
+def _save_cached_series(key: str, series: pd.Series) -> None:
+    try:
+        with _cache_path(key).open("w") as f:
+            json.dump(
+                {
+                    "fetched_at": time.time(),
+                    "data": {str(int(k)): float(v) for k, v in series.items()},
+                },
+                f,
+            )
+    except Exception:
+        pass  # cache write failure is non-fatal
 
 
 @dataclass
@@ -73,11 +128,17 @@ def _fetch_ticker_annual_returns(
     end_year: int,
 ) -> pd.Series:
     """
-    Download adjusted closing prices for `ticker` and compute annual returns.
+    Return annual total returns for `ticker` over [start_year, end_year].
 
-    Fetches one extra year before `start_year` so the first return is a
-    full-year price change.  Raises ValueError if no data is available.
+    Results are cached to disk; subsequent calls for the same parameters
+    skip the network request entirely.  The cache is refreshed after 24 hours
+    when the requested range includes the current or previous year.
     """
+    cache_key = f"{ticker}_{start_year}_{end_year}"
+    cached = _load_cached_series(cache_key, end_year)
+    if cached is not None:
+        return cached.rename(ticker)
+
     raw = yf.download(
         ticker,
         start=f"{start_year - 1}-01-01",
@@ -98,6 +159,7 @@ def _fetch_ticker_annual_returns(
         raise ValueError(
             f"Ticker '{ticker}' has no data in the range {start_year}–{end_year}."
         )
+    _save_cached_series(cache_key, filtered)
     return filtered.rename(ticker)
 
 
@@ -168,9 +230,17 @@ def _fetch_ticker_with_proxy(
 
 def _fetch_cpi_annual(start_year: int, end_year: int) -> pd.Series:
     """
-    Fetch monthly CPIAUCSL from FRED's public CSV endpoint (no API key needed),
-    then compute annual average-over-average inflation rates.
+    Return annual CPI inflation rates over [start_year, end_year].
+
+    Data is fetched from FRED's public CPIAUCSL endpoint and cached to disk;
+    subsequent calls skip the network request.  Cache TTL follows the same
+    rules as ticker data (24 hours when the range includes recent years).
     """
+    cache_key = f"CPI_{start_year}_{end_year}"
+    cached = _load_cached_series(cache_key, end_year)
+    if cached is not None:
+        return cached
+
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL"
     try:
         resp = requests.get(url, timeout=30)
@@ -190,7 +260,9 @@ def _fetch_cpi_annual(start_year: int, end_year: int) -> pd.Series:
     annual_avg = df["CPI"].resample("YE").mean()
     inflation = annual_avg.pct_change().dropna()
     inflation.index = inflation.index.year.astype(int)
-    return inflation[(inflation.index >= start_year) & (inflation.index <= end_year)]
+    result = inflation[(inflation.index >= start_year) & (inflation.index <= end_year)]
+    _save_cached_series(cache_key, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +291,14 @@ def build_historical_dataset(
         ticker has no data, the proxy's return is substituted.  A ticker
         not present in the dict (or where the dict is None) gets no proxy.
     """
+    # Merge duplicate tickers (same symbol in multiple accounts) by summing values.
+    # This keeps returns_df columns aligned with ticker_values for the matmul in
+    # run_simulation_historical.  Tax treatment is handled separately in app.py.
+    seen: dict[str, float] = {}
+    for t, v in ticker_values:
+        seen[t] = seen.get(t, 0.0) + v
+    ticker_values = list(seen.items())
+
     tickers = [t for t, _ in ticker_values]
     print(f"\nFetching price history for: {', '.join(tickers)}")
 
@@ -228,18 +308,24 @@ def build_historical_dataset(
     for ticker in tickers:
         proxy = proxies.get(ticker)
         proxy_note = f" (proxy: {proxy})" if proxy else ""
+        cache_key = f"{ticker}_{start_year}_{end_year}"
+        from_cache = _load_cached_series(cache_key, end_year) is not None
         print(f"  {ticker}{proxy_note}...", end=" ", flush=True)
         series = _fetch_ticker_with_proxy(ticker, proxy, start_year, end_year)
         returns_dict[ticker] = series
-        print(f"{len(series)} years ({series.index[0]}–{series.index[-1]})")
+        source = "cached" if from_cache else "downloaded"
+        print(f"{len(series)} years ({series.index[0]}–{series.index[-1]}) [{source}]")
 
     returns_df = pd.DataFrame(returns_dict)
     # Drop years where any ticker still has no data after proxy filling
     returns_df = returns_df.dropna()
 
+    cpi_key = f"CPI_{start_year}_{end_year}"
+    cpi_from_cache = _load_cached_series(cpi_key, end_year) is not None
     print("  Fetching CPI inflation (FRED CPIAUCSL)...", end=" ", flush=True)
     inflation = _fetch_cpi_annual(start_year, end_year)
-    print(f"{len(inflation)} years ({inflation.index[0]}–{inflation.index[-1]})")
+    source = "cached" if cpi_from_cache else "downloaded"
+    print(f"{len(inflation)} years ({inflation.index[0]}–{inflation.index[-1]}) [{source}]")
 
     common_years = sorted(set(returns_df.index) & set(inflation.index))
     if not common_years:

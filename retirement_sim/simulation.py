@@ -60,6 +60,14 @@ class PortfolioParams:
     market: MarketParams = field(default_factory=MarketParams)
     cash_fraction: float = 0.0   # fraction of initial_balance held in cash/fixed-rate
     cash_rate: float = 0.0       # annual return on the cash portion (e.g. 0.045)
+    ss_delay_years: int = 0      # years from retirement start until SS/pension begins
+    years_to_retirement: int = 0 # pre-retirement accumulation years (no withdrawals)
+    annual_savings: float = 0.0  # annual contribution during accumulation (today's dollars)
+
+    @property
+    def total_years(self) -> int:
+        """Total simulation length: accumulation phase + retirement phase."""
+        return self.years_to_retirement + self.years
 
     def __post_init__(self) -> None:
         if self.stock_fraction is None and self.tickers is None:
@@ -123,7 +131,7 @@ def run_simulation(
       3. Floor balance at 0
     """
     rng = np.random.default_rng(seed)
-    n_sims, n_years = params.num_simulations, params.years
+    n_sims, n_years = params.num_simulations, params.total_years
     mkt = params.market
 
     stock_returns = rng.normal(mkt.stock_mean, mkt.stock_std, (n_sims, n_years))
@@ -171,7 +179,7 @@ def run_simulation_historical(
         'fixed'  — use params.market.inflation_mean (no year-to-year variance).
     """
     rng = np.random.default_rng(seed)
-    n_sims, n_years = params.num_simulations, params.years
+    n_sims, n_years = params.num_simulations, params.total_years
 
     returns_array = historical.returns.values.astype(float)   # (n_hist, n_tickers)
     inflation_array = historical.inflation.values.astype(float)  # (n_hist,)
@@ -232,46 +240,73 @@ def _simulate_balances(
     inflation_rates: np.ndarray,     # (n_sims, n_years)
 ) -> SimulationResults:
     """
-    Given pre-computed portfolio returns and inflation rates, evolve balances
-    year by year and record depletion.
+    Evolve balances over the full simulation horizon (accumulation + retirement).
 
-    Each year:
-      balance = balance × (1 + r_portfolio) − withdrawal
-      withdrawal grows by that year's inflation rate
-      balance is floored at 0 once depleted
+    Accumulation phase (years 0..years_to_retirement-1):
+      balance = balance × (1 + r) + inflation-adjusted annual savings
+    Retirement phase (years years_to_retirement..total_years-1):
+      balance = balance × (1 + r) − inflation-adjusted withdrawal
+      SS delay is applied relative to retirement start
+
+    Returns SimulationResults whose balances start at retirement (col 0 =
+    balance at retirement start). depletion_year is relative to retirement
+    start so all downstream analysis and charts remain unchanged.
     """
-    n_sims, n_years = portfolio_returns.shape
-    base_withdrawal = params.net_withdrawal
+    n_sims, n_total = portfolio_returns.shape
+    years_to_ret = params.years_to_retirement
+    n_ret = params.years
+    ss_start_yr = params.ss_delay_years   # offset from retirement start
 
-    # Cumulative inflation multipliers: cum[sim, yr] = ∏(1+inf) for years 0..yr
     cum_inflation = np.cumprod(1.0 + inflation_rates, axis=1)
 
-    # Nominal withdrawal for each year
-    withdrawals = np.empty((n_sims, n_years))
-    withdrawals[:, 0] = base_withdrawal
-    if n_years > 1:
-        withdrawals[:, 1:] = base_withdrawal * cum_inflation[:, :-1]
+    # ── Savings during accumulation (inflation-adjusted, year 0 = today's dollars)
+    savings = np.zeros((n_sims, n_total))
+    if years_to_ret > 0 and params.annual_savings > 0:
+        savings[:, 0] = params.annual_savings
+        if years_to_ret > 1:
+            savings[:, 1:years_to_ret] = (
+                params.annual_savings * cum_inflation[:, :years_to_ret - 1]
+            )
 
-    balances = np.empty((n_sims, n_years + 1))
+    # ── Withdrawals during retirement (0 during accumulation, SS-aware after)
+    ret_base = np.full(n_ret, params.net_withdrawal)
+    if ss_start_yr > 0:
+        pre = min(ss_start_yr, n_ret)
+        ret_base[:pre] = params.annual_withdrawal
+
+    full_base = np.zeros(n_total)
+    if n_ret > 0:
+        full_base[years_to_ret:] = ret_base
+
+    withdrawals = np.zeros((n_sims, n_total))
+    withdrawals[:, 0] = full_base[0]
+    if n_total > 1:
+        withdrawals[:, 1:] = full_base[1:] * cum_inflation[:, :-1]
+
+    # ── Balance evolution
+    balances = np.empty((n_sims, n_total + 1))
     balances[:, 0] = params.initial_balance
     already_depleted = np.zeros(n_sims, dtype=bool)
 
-    for yr in range(n_years):
+    for yr in range(n_total):
         after_return = balances[:, yr] * (1.0 + portfolio_returns[:, yr])
-        after_withdrawal = after_return - withdrawals[:, yr]
-        after_withdrawal = np.where(already_depleted, 0.0, after_withdrawal)
-        after_withdrawal = np.maximum(after_withdrawal, 0.0)
-        balances[:, yr + 1] = after_withdrawal
-        already_depleted |= after_withdrawal == 0.0
+        after_flow = after_return + savings[:, yr] - withdrawals[:, yr]
+        after_flow = np.where(already_depleted, 0.0, after_flow)
+        after_flow = np.maximum(after_flow, 0.0)
+        balances[:, yr + 1] = after_flow
+        if yr >= years_to_ret:   # only flag depletion during retirement
+            already_depleted |= after_flow == 0.0
 
-    # Record first year of depletion
+    # ── Slice to retirement phase; depletion year relative to retirement start
+    ret_balances = balances[:, years_to_ret:]   # (n_sims, n_ret + 1)
+
     depletion_year = np.full(n_sims, np.nan)
-    for yr in range(1, n_years + 1):
-        depleted_now = (balances[:, yr] == 0.0) & np.isnan(depletion_year)
+    for yr in range(1, n_ret + 1):
+        depleted_now = (ret_balances[:, yr] == 0.0) & np.isnan(depletion_year)
         depletion_year = np.where(depleted_now, float(yr), depletion_year)
 
     return SimulationResults(
         params=params,
-        balances=balances,
+        balances=ret_balances,
         depletion_year=depletion_year,
     )

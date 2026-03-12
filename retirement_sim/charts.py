@@ -14,6 +14,24 @@ from .simulation import SimulationResults
 from .analysis import balance_percentiles, sweep_withdrawal_rates
 
 
+_ACCOUNT_COLORS = {
+    "Cash":             "#7f7f7f",   # gray   — spent first
+    "Brokerage":        "#ff7f0e",   # orange
+    "Traditional 401k": "#1f77b4",   # blue
+    "Traditional IRA":  "#aec7e8",   # light blue
+    "After-Tax 401k":   "#17becf",   # cyan
+    "Roth 401k":        "#2ca02c",   # green
+    "Roth IRA":         "#98df8a",   # light green — spent last
+}
+
+# Draw order: typically spend Cash/Brokerage before tax-deferred, Roth last
+_ACCOUNT_ORDER = [
+    "Cash", "Brokerage",
+    "Traditional 401k", "Traditional IRA", "After-Tax 401k",
+    "Roth 401k", "Roth IRA",
+]
+
+
 _PERCENTILE_COLORS = {
     10.0: "#d62728",   # red
     25.0: "#ff7f0e",   # orange
@@ -181,6 +199,65 @@ def plot_depletion_histogram(
     if output_path:
         fig.savefig(output_path, dpi=150)
         print(f"  Chart saved: {output_path}")
+    return fig
+
+
+def plot_account_balances(
+    results: SimulationResults,
+    account_groups: dict[str, float],
+) -> plt.Figure:
+    """
+    Stacked area chart showing each account type's projected balance over the
+    retirement horizon, using the median total-portfolio path.
+
+    Assumes proportional depletion across accounts (each account shrinks at the
+    same rate as the total portfolio). Stacked in typical spending order:
+    Cash → Brokerage → Traditional → Roth.
+    """
+    years = np.arange(results.params.years + 1)
+    median_balance = np.median(results.balances, axis=0)
+    total_initial = sum(account_groups.values())
+
+    # Build ordered list, preserving _ACCOUNT_ORDER, unknown types at the top
+    ordered: list[tuple[str, float]] = []
+    for acct in _ACCOUNT_ORDER:
+        if acct in account_groups:
+            ordered.append((acct, account_groups[acct]))
+    for acct, val in account_groups.items():
+        if acct not in _ACCOUNT_ORDER:
+            ordered.append((acct, val))
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    bottom = np.zeros(len(years))
+    for acct, initial_val in ordered:
+        fraction = initial_val / total_initial if total_initial > 0 else 0.0
+        acct_balance = median_balance * fraction
+        color = _ACCOUNT_COLORS.get(acct, "#bcbd22")
+        ax.fill_between(
+            years, bottom, bottom + acct_balance,
+            alpha=0.80, color=color,
+            label=f"{acct}  (${initial_val:,.0f})",
+        )
+        bottom += acct_balance
+
+    ax.plot(years, median_balance, color="black", linewidth=1.5,
+            linestyle="--", label="Total (median)", zorder=5)
+
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_money))
+    ax.set_xlabel("Retirement Year", fontsize=12)
+    ax.set_ylabel("Portfolio Balance", fontsize=12)
+    ax.set_title(
+        "Account Balance by Type — Median Scenario\n"
+        "(proportional withdrawals assumed across account types)",
+        fontsize=13,
+    )
+    ax.legend(loc="upper right", fontsize=9)
+    ax.set_xlim(0, results.params.years)
+    ax.set_ylim(bottom=0)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
     return fig
 
 

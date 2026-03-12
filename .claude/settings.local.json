@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python main.py --portfolio 1000000 --stocks 0.60 --withdrawal 60000 --social-security 24000 --years 30 --simulations 5000 --no-charts --seed 42)",
+      "Bash(pip install:*)",
+      "Bash(python main.py --portfolio 1000000 --stocks 0.60 --withdrawal 60000 --social-security 24000 --no-charts --seed 42)",
+      "Bash(python -m pytest tests/ -v)"
+    ]
+  }
+}

@@ -1,6 +1,9 @@
 # Virtual environment
 .venv/
 
+# Market data disk cache
+.market_cache/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -27,3 +30,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Personal files
+*.json

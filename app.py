@@ -26,11 +26,35 @@ from retirement_sim.analysis import (
     sweep_withdrawal_rates,
 )
 from retirement_sim.charts import (
+    plot_account_balances,
     plot_balance_percentiles,
     plot_depletion_histogram,
     plot_success_rates,
 )
 from retirement_sim.simulation import MarketParams, PortfolioParams
+
+
+# ── Cached data fetching ───────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_historical(
+    ticker_values: tuple[tuple[str, float], ...],
+    start_year: int,
+    end_year: int,
+    ticker_proxies: tuple[tuple[str, str], ...] | None,
+):
+    """
+    Thin wrapper around build_historical_dataset with Streamlit-level caching.
+    Avoids re-reading even disk-cached files when the user reruns with the
+    same parameters within the same Streamlit session (ttl=1 hour).
+    """
+    from retirement_sim.market_data import build_historical_dataset
+    return build_historical_dataset(
+        list(ticker_values),
+        start_year=start_year,
+        end_year=end_year,
+        ticker_proxies=dict(ticker_proxies) if ticker_proxies else None,
+    )
 
 
 # ── Page configuration ────────────────────────────────────────────────────────
@@ -76,7 +100,11 @@ def _init_state() -> None:
         "holdings_df":  _EMPTY_HOLDINGS.copy(),
         "editor_key":   0,          # incremented on JSON import to reset the table
         "import_id":    None,       # tracks which file has been imported
-        "ss_override":  None,       # social_security read from the imported file
+        "ss_override":           None,  # social_security read from the imported file
+        "ss_delay_override":     None,  # ss_delay_years read from the imported file
+        "ytr_override":          None,  # years_to_retirement from imported file
+        "annual_savings_override": None, # annual_savings from imported file
+        "account_groups":        None,  # {account_type: initial_value} for chart
         "results":      None,
         "sweep":        None,
         "safe_withdrawal": None,
@@ -93,7 +121,13 @@ _init_state()
 
 # ── JSON helpers ──────────────────────────────────────────────────────────────
 
-def _df_to_json(df: pd.DataFrame, social_security: float) -> str:
+def _df_to_json(
+    df: pd.DataFrame,
+    social_security: float,
+    ss_delay_years: int = 0,
+    years_to_retirement: int = 0,
+    annual_savings: float = 0.0,
+) -> str:
     """Serialise the holdings DataFrame to our portfolio JSON format."""
     holdings = []
     cash_index = 0
@@ -138,10 +172,16 @@ def _df_to_json(df: pd.DataFrame, social_security: float) -> str:
     out: dict = {"holdings": holdings}
     if social_security > 0:
         out["social_security"] = social_security
+    if ss_delay_years > 0:
+        out["ss_delay_years"] = ss_delay_years
+    if years_to_retirement > 0:
+        out["years_to_retirement"] = years_to_retirement
+    if annual_savings > 0:
+        out["annual_savings"] = annual_savings
     return json.dumps(out, indent=2)
 
 
-def _json_to_df(data: dict) -> tuple[pd.DataFrame, float | None]:
+def _json_to_df(data: dict) -> tuple[pd.DataFrame, float | None, int | None, int | None, float | None]:
     """Parse a portfolio JSON dict into (DataFrame, social_security)."""
     rows = []
     for h in data.get("holdings", []):
@@ -165,7 +205,16 @@ def _json_to_df(data: dict) -> tuple[pd.DataFrame, float | None]:
         df = _EMPTY_HOLDINGS.copy()
 
     ss = data.get("social_security")
-    return df, float(ss) if ss is not None else None
+    ss_delay = data.get("ss_delay_years")
+    ytr = data.get("years_to_retirement")
+    savings = data.get("annual_savings")
+    return (
+        df,
+        float(ss) if ss is not None else None,
+        int(ss_delay) if ss_delay is not None else None,
+        int(ytr) if ytr is not None else None,
+        float(savings) if savings is not None else None,
+    )
 
 
 def _parse_holdings(
@@ -334,6 +383,41 @@ with st.sidebar:
         help="Annual SS/pension income in today's dollars — subtracted from the "
              "portfolio withdrawal each year.",
     )
+    ss_delay_default = int(st.session_state.ss_delay_override or 0)
+    ss_delay_widget_key = f"ss_delay_{st.session_state.editor_key}_{ss_delay_default}"
+    ss_delay_years = st.number_input(
+        "Years before collecting SS",
+        min_value=0, max_value=40, value=ss_delay_default, step=1,
+        key=ss_delay_widget_key,
+        help="Number of years from retirement start until SS/pension income begins. "
+             "During this period the full withdrawal comes from the portfolio.",
+    )
+    st.divider()
+
+    # ── Pre-retirement accumulation ───────────────────────────────────────────
+    with st.expander("Pre-retirement accumulation"):
+        st.caption(
+            "Model the growth of your portfolio before retirement. "
+            "Savings are added each year and grow at the portfolio's blended return. "
+            "No withdrawals occur until retirement begins."
+        )
+        ytr_default = int(st.session_state.ytr_override or 0)
+        ytr_widget_key = f"ytr_{st.session_state.editor_key}_{ytr_default}"
+        years_to_retirement = st.number_input(
+            "Years to retirement",
+            min_value=0, max_value=50, value=ytr_default, step=1,
+            key=ytr_widget_key,
+            help="Years until you stop working. During this period no withdrawals "
+                 "are made and annual savings are added to the portfolio.",
+        )
+        savings_default = float(st.session_state.annual_savings_override or 0.0)
+        savings_widget_key = f"savings_{st.session_state.editor_key}_{int(savings_default)}"
+        annual_savings = st.number_input(
+            "Annual savings ($/yr)",
+            min_value=0.0, value=savings_default, step=1_000.0, format="%f",
+            key=savings_widget_key,
+            help="Annual contribution in today's dollars (inflation-adjusted each year).",
+        )
     st.divider()
 
     # ── Withdrawal ────────────────────────────────────────────────────────────
@@ -489,16 +573,24 @@ if historical_mode:
                 if import_id != st.session_state.import_id:
                     try:
                         data = json.load(uploaded_file)
-                        df_imported, ss_imported = _json_to_df(data)
-                        st.session_state.holdings_df = df_imported
+                        df_imported, ss_imported, ss_delay_imported, ytr_imported, savings_imported = _json_to_df(data)
+                        st.session_state.holdings_df = df_imported.reset_index(drop=True)
                         st.session_state.editor_key += 1
                         st.session_state.import_id = import_id
                         if ss_imported is not None:
                             st.session_state.ss_override = ss_imported
+                        if ss_delay_imported is not None:
+                            st.session_state.ss_delay_override = ss_delay_imported
+                        if ytr_imported is not None:
+                            st.session_state.ytr_override = ytr_imported
+                        if savings_imported is not None:
+                            st.session_state.annual_savings_override = savings_imported
                         n = len(df_imported)
                         st.success(
                             f"Imported {n} holding{'s' if n != 1 else ''}."
-                            + (f" SS set to ${ss_imported:,.0f}/yr." if ss_imported else "")
+                            + (f" SS ${ss_imported:,.0f}/yr." if ss_imported else "")
+                            + (f" SS delay {ss_delay_imported} yr." if ss_delay_imported else "")
+                            + (f" {ytr_imported} yr to retirement." if ytr_imported else "")
                         )
                         st.rerun()
                     except Exception as exc:
@@ -507,7 +599,7 @@ if historical_mode:
         # Editable holdings table (full width)
         st.caption("Click any cell to edit · ＋ to add a row · checkbox + 🗑 to delete")
         edited_df = st.data_editor(
-            st.session_state.holdings_df.reset_index(drop=True),
+            st.session_state.holdings_df,
             key=f"holdings_{st.session_state.editor_key}",
             num_rows="dynamic",
             hide_index=True,
@@ -562,8 +654,9 @@ if historical_mode:
                 ),
             },
         )
-        # Persist edits to session state immediately
-        st.session_state.holdings_df = edited_df
+        # Persist edits to session state immediately (normalize index to avoid
+        # row-tracking issues on next render with hide_index=True)
+        st.session_state.holdings_df = edited_df.reset_index(drop=True)
 
         # Footer: totals + export
         tv_preview, _, ta_preview, cash_total_preview, _, _ = _parse_holdings(edited_df)
@@ -586,7 +679,10 @@ if historical_mode:
             else:
                 st.caption("No valid holdings yet — add rows above.")
         with foot_r:
-            json_export = _df_to_json(edited_df, social_security)
+            json_export = _df_to_json(
+                edited_df, social_security, int(ss_delay_years),
+                int(years_to_retirement), float(annual_savings),
+            )
             st.download_button(
                 "💾  Save as JSON",
                 data=json_export,
@@ -640,13 +736,15 @@ if run_clicked:
                         "Add at least one holding (ticker + value) before running."
                     )
 
-                st.write("⬇️ Downloading historical market data…")
-                from retirement_sim.market_data import build_historical_dataset
-                historical = build_historical_dataset(
-                    ticker_values,
-                    start_year=int(data_start),
-                    end_year=int(data_end),
-                    ticker_proxies=ticker_proxies or None,
+                st.write("⬇️ Loading historical market data…")
+                proxies_tuple = (
+                    tuple(sorted(ticker_proxies.items())) if ticker_proxies else None
+                )
+                historical = _fetch_historical(
+                    tuple(ticker_values),
+                    int(data_start),
+                    int(data_end),
+                    proxies_tuple,
                 )
 
                 inf_mode = "actual" if inflation_opt == "Actual CPI (FRED)" else "fixed"
@@ -681,6 +779,18 @@ if run_clicked:
                     inflation_mean=inf_mean, inflation_std=inf_std_val,
                 )
 
+            # ── Account groups for the per-account balance chart ──────────────
+            if ticker_values or cash_total > 0:
+                acct_groups: dict[str, float] = {}
+                for t, v in (ticker_values or []):
+                    key = account_types.get(t, "Brokerage")
+                    acct_groups[key] = acct_groups.get(key, 0.0) + v
+                if cash_total > 0:
+                    acct_groups["Cash"] = acct_groups.get("Cash", 0.0) + cash_total
+                st.session_state.account_groups = acct_groups
+            else:
+                st.session_state.account_groups = None
+
             # ── Tax gross-up ──────────────────────────────────────────────────
             # Convert after-tax spending goal → pre-tax portfolio withdrawal
             net_spend = annual_withdrawal  # may be None if finding SWR
@@ -707,6 +817,9 @@ if run_clicked:
                 market=market,
                 cash_fraction=cash_frac_param,
                 cash_rate=avg_cash_rate,
+                ss_delay_years=int(ss_delay_years),
+                years_to_retirement=int(years_to_retirement),
+                annual_savings=float(annual_savings),
             )
 
             # ── Safe withdrawal rate search (if requested) ────────────────────
@@ -782,12 +895,23 @@ if st.session_state.results is not None:
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric(
-            "Starting Balance",
-            f"${p.initial_balance:,.0f}",
-            help=f"Net portfolio draw: ${p.net_withdrawal:,.0f}/yr after "
-                 f"${p.social_security:,.0f}/yr SS/pension offset.",
-        )
+        if p.years_to_retirement > 0:
+            ret_start = float(np.median(results.balances[:, 0]))
+            st.metric(
+                "Balance at Retirement (median)",
+                f"${ret_start:,.0f}",
+                delta=f"from ${p.initial_balance:,.0f} over {p.years_to_retirement} yr",
+                delta_color="off",
+                help=f"Median portfolio at start of retirement after {p.years_to_retirement} "
+                     f"year(s) of accumulation with ${p.annual_savings:,.0f}/yr savings.",
+            )
+        else:
+            st.metric(
+                "Starting Balance",
+                f"${p.initial_balance:,.0f}",
+                help=f"Net portfolio draw: ${p.net_withdrawal:,.0f}/yr after "
+                     f"${p.social_security:,.0f}/yr SS/pension offset.",
+            )
     with m2:
         rate_pct = summary["success_rate"] * 100
         survivors = summary["num_simulations"] - summary["num_depleted"]
@@ -842,18 +966,32 @@ if st.session_state.results is not None:
     st.divider()
 
     # ── Charts in tabs ────────────────────────────────────────────────────────
-    tab1, tab2, tab3 = st.tabs([
+    account_groups = st.session_state.account_groups
+    tab_labels = [
         "📉  Balance Percentiles",
         "✅  Success Rate vs. Withdrawal",
         "📊  Depletion Year Distribution",
-    ])
+    ]
+    if account_groups:
+        tab_labels.insert(1, "🗂️  Account Balances")
 
-    with tab1:
+    tabs = st.tabs(tab_labels)
+    tab_idx = 0
+
+    with tabs[tab_idx]:
         fig = plot_balance_percentiles(results)
         st.pyplot(fig, width="stretch")
         plt.close(fig)
+    tab_idx += 1
 
-    with tab2:
+    if account_groups:
+        with tabs[tab_idx]:
+            fig = plot_account_balances(results, account_groups)
+            st.pyplot(fig, width="stretch")
+            plt.close(fig)
+        tab_idx += 1
+
+    with tabs[tab_idx]:
         fig = plot_success_rates(
             results,
             sweep=sweep,
@@ -863,8 +1001,9 @@ if st.session_state.results is not None:
         )
         st.pyplot(fig, width="stretch")
         plt.close(fig)
+    tab_idx += 1
 
-    with tab3:
+    with tabs[tab_idx]:
         fig = plot_depletion_histogram(results)
         st.pyplot(fig, width="stretch")
         plt.close(fig)
