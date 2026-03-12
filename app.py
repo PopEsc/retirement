@@ -66,6 +66,20 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# PWA support — links the web app manifest so Android Chrome shows
+# "Add to Home Screen" and the installed app launches full-screen.
+st.markdown(
+    """
+    <link rel="manifest" href="app/static/manifest.json">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="RetireSim">
+    <meta name="theme-color" content="#1f77b4">
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ── Account type constants ─────────────────────────────────────────────────────
 

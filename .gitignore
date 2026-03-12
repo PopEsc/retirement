@@ -19,8 +19,8 @@ build/
 .coverage
 htmlcov/
 
-# Streamlit
-.streamlit/
+# Streamlit (keep config.toml but exclude secrets)
+.streamlit/secrets.toml
 
 # OS
 .DS_Store
