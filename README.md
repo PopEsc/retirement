@@ -8,11 +8,58 @@ annual income that can be withdrawn without depleting the portfolio.
 - Python 3.11 or later
 - Internet connection (historical mode only — fetches data from Yahoo Finance and FRED)
 
-## Installation
+## Running the GUI
+
+The interactive web UI is the easiest way to use the simulator.
+
+### 1. Create a virtual environment (first time only)
+
+```bash
+python -m venv .venv
+```
+
+### 2. Activate the virtual environment
+
+**Windows (Git Bash / MINGW):**
+```bash
+source .venv/Scripts/activate
+```
+
+**Windows (PowerShell):**
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+**macOS / Linux:**
+```bash
+source .venv/bin/activate
+```
+
+### 3. Install dependencies (first time only)
 
 ```bash
 pip install -r requirements.txt
 ```
+
+### 4. Launch the app
+
+```bash
+python -m streamlit run app.py
+```
+
+The app opens automatically in your browser at `http://localhost:8501`.
+
+### Quick start
+
+1. Select **Historical** or **Parametric** mode in the sidebar
+2. **Historical mode:** add your holdings (ticker, value, account type) in the Portfolio Holdings table, or import a `portfolio.json` file
+3. **Parametric mode:** enter your portfolio balance and stock/bond allocation in the sidebar
+4. Set your annual withdrawal amount and Social Security income
+5. Click **🚀 Run Simulation**
+
+Historical market data is cached locally in `.market_cache/` after the first download, so subsequent runs are fast.
+
+---
 
 ## Two simulation modes
 
@@ -66,21 +113,31 @@ It also supports per-holding proxy tickers (see below).
 ```json
 {
   "holdings": [
-    { "ticker": "VTI",  "value": 500000, "proxy": "VTSMX" },
-    { "ticker": "VXUS", "value": 200000 },
-    { "ticker": "BND",  "value": 300000, "proxy": "AGG"   }
+    { "ticker": "VTI",  "value": 500000, "account_type": "Traditional IRA",  "proxy": "VTSMX" },
+    { "ticker": "VXUS", "value": 200000, "account_type": "Roth IRA" },
+    { "ticker": "BND",  "value": 300000, "account_type": "Brokerage",        "cost_basis": 180000, "proxy": "AGG" },
+    { "value": 50000,   "account_type": "Cash", "cash_rate": 4.5 }
   ],
-  "social_security": 24000
+  "social_security": 24000,
+  "ss_delay_years": 10,
+  "years_to_retirement": 5,
+  "annual_savings": 30000
 }
 ```
 
 | Field | Required | Description |
 |---|---|---|
 | `holdings` | Yes | Array of holding objects |
-| `holdings[].ticker` | Yes | Yahoo Finance ticker symbol |
+| `holdings[].ticker` | Yes* | Yahoo Finance ticker symbol. *Optional for Cash accounts. |
 | `holdings[].value` | Yes | Current dollar value of this holding |
+| `holdings[].account_type` | No | `Traditional IRA`, `Traditional 401k`, `Roth IRA`, `Roth 401k`, `After-Tax 401k`, `Brokerage` (default), or `Cash` |
+| `holdings[].cash_rate` | No | Annual interest rate for `Cash` accounts (e.g. `4.5` for 4.5%) |
+| `holdings[].cost_basis` | No | Original purchase cost for `Brokerage` accounts — used to compute taxable gains |
 | `holdings[].proxy` | No | Ticker to use when this holding lacks data |
-| `social_security` | No | Annual SS/pension income (today's dollars). Overridden by `--social-security` on the CLI. |
+| `social_security` | No | Annual SS/pension income (today's dollars) |
+| `ss_delay_years` | No | Years from retirement start until SS/pension begins |
+| `years_to_retirement` | No | Years of pre-retirement accumulation before withdrawals begin |
+| `annual_savings` | No | Annual savings contribution during accumulation (today's dollars) |
 
 The portfolio balance defaults to the sum of all holding values.  Override
 with `--portfolio` on the CLI.
