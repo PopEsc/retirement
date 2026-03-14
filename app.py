@@ -807,6 +807,7 @@ if run_clicked:
 
             # ── Tax gross-up ──────────────────────────────────────────────────
             # Convert after-tax spending goal → pre-tax portfolio withdrawal
+            pretax_frac, brokerage_frac, gains_frac = 0.0, 0.0, 0.0
             net_spend = annual_withdrawal  # may be None if finding SWR
             if net_spend is not None and (ticker_values or cash_total > 0):
                 pretax_frac, brokerage_frac, gains_frac = _compute_portfolio_fracs(
