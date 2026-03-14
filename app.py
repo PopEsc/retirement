@@ -32,6 +32,8 @@ from retirement_sim.charts import (
     plot_success_rates,
 )
 from retirement_sim.simulation import MarketParams, PortfolioParams
+from retirement_sim.tax_calculator import TaxProfile, compute_total_tax, gross_up_withdrawal
+from retirement_sim.tax_data import FILING_STATUS_LABELS, STATE_NAMES
 
 
 # ── Cached data fetching ───────────────────────────────────────────────────────
@@ -125,6 +127,8 @@ def _init_state() -> None:
         "target_success":  None,
         "cfg":          None,
         "error_msg":    None,
+        "tax_profile":       None,  # TaxProfile used for this run
+        "portfolio_fracs":   None,  # (pretax_frac, brokerage_frac, gains_frac)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -294,42 +298,23 @@ def _parse_holdings(
     return tv, tp, ta, cash_total, avg_cash_rate, basis
 
 
-def _gross_withdrawal(
-    net_withdrawal: float,
+def _compute_portfolio_fracs(
     ticker_values: list[tuple[str, float]],
     cash_total: float,
     account_types: dict[str, str],
     basis_by_ticker: dict[str, float],
-    ordinary_rate: float,
-    capgains_rate: float,
-) -> float:
-    """Gross up a net (after-tax) spending goal to the pre-tax portfolio withdrawal.
-
-    Traditional IRA/401k: withdrawals taxed as ordinary income.
-    Brokerage: capital gains tax on the gains portion (value minus cost basis).
-    Roth / After-Tax 401k: withdrawals tax-free.
-    Cash: treated as return of principal — no additional gross-up.
-    """
-    if net_withdrawal <= 0:
-        return net_withdrawal
+) -> tuple[float, float, float]:
+    """Return (pretax_frac, brokerage_frac, gains_frac) for the holdings."""
     total = sum(v for _, v in ticker_values) + cash_total
     if total == 0:
-        return net_withdrawal
+        return 0.0, 0.0, 0.0
 
     pretax_val    = sum(v for t, v in ticker_values if account_types.get(t, "Brokerage") in _PRETAX_TYPES)
     brokerage_val = sum(v for t, v in ticker_values if account_types.get(t, "Brokerage") in _BROKERAGE_TYPES)
-    roth_val      = total - pretax_val - brokerage_val - cash_total
 
     pretax_frac    = pretax_val    / total
     brokerage_frac = brokerage_val / total
-    roth_frac      = max(roth_val, 0.0) / total
-    cash_frac      = cash_total    / total
 
-    # Pre-tax: need X/(1−r) gross to net X after ordinary income tax
-    pretax_factor = pretax_frac / max(1 - ordinary_rate, 0.01)
-
-    # Brokerage: per-holding gains fraction = (value - basis) / value
-    # Aggregate gains fraction weighted by brokerage holding values
     if brokerage_val > 0:
         brokerage_tickers = [(t, v) for t, v in ticker_values
                              if account_types.get(t, "Brokerage") in _BROKERAGE_TYPES]
@@ -337,17 +322,11 @@ def _gross_withdrawal(
             v * max(0.0, (v - basis_by_ticker.get(t, 0.0)) / v)
             for t, v in brokerage_tickers
         )
-        agg_gains_frac = weighted_gains / brokerage_val
+        gains_frac = weighted_gains / brokerage_val
     else:
-        agg_gains_frac = 0.0
-    brokerage_factor = brokerage_frac / max(1 - capgains_rate * agg_gains_frac, 0.01)
+        gains_frac = 0.0
 
-    # Roth: tax-free
-    roth_factor = roth_frac
-    # Cash: return of principal, no gross-up
-    cash_factor = cash_frac
-
-    return net_withdrawal * (pretax_factor + brokerage_factor + roth_factor + cash_factor)
+    return pretax_frac, brokerage_frac, gains_frac
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -443,9 +422,10 @@ with st.sidebar:
     )
     if withdrawal_mode == "Fixed amount":
         annual_withdrawal: float | None = st.number_input(
-            "Annual gross withdrawal ($/yr)",
+            "Annual spending goal ($/yr, after tax)",
             min_value=0.0, value=60_000.0, step=1_000.0, format="%f",
-            help="Total yearly spending need, in today's dollars (before SS offset).",
+            help="Total yearly spending need in today's dollars (after tax, before SS offset). "
+                 "The simulator grosses this up using your tax profile and account mix.",
         )
         target_success: float | None = None
     else:
@@ -458,10 +438,17 @@ with st.sidebar:
 
     # ── Simulation ────────────────────────────────────────────────────────────
     st.subheader("Simulation")
-    sim_years = st.number_input(
-        "Simulation horizon (years)",
-        min_value=5, max_value=60, value=30, step=5,
-    )
+    col_age1, col_age2 = st.columns(2)
+    with col_age1:
+        current_age = st.number_input(
+            "Current age", min_value=0, max_value=100, value=65, step=1,
+        )
+    with col_age2:
+        expected_lifespan = st.number_input(
+            "Life expectancy", min_value=50, max_value=120, value=90, step=1,
+        )
+    sim_years = max(1, int(expected_lifespan) - int(current_age))
+    st.caption(f"Simulation horizon: **{sim_years} years**")
     n_sims = st.select_slider(
         "Monte Carlo runs",
         options=[1_000, 5_000, 10_000, 25_000, 50_000],
@@ -534,21 +521,34 @@ with st.sidebar:
     with st.expander("Tax settings"):
         st.caption(
             "Withdrawal amounts are entered as **after-tax spending goals**. "
-            "The simulator grosses up the portfolio withdrawal to cover taxes "
-            "based on your account mix."
+            "The simulator uses 2026 federal and state tax brackets to gross up "
+            "the portfolio withdrawal based on your account mix and tax profile."
         )
-        ordinary_rate_pct = st.number_input(
-            "Ordinary income tax rate (%)",
-            min_value=0.0, max_value=50.0, value=22.0, step=0.5, format="%.1f",
-            help="Effective rate applied to Traditional IRA / 401k withdrawals.",
+        filing_status = st.selectbox(
+            "Filing status",
+            options=list(FILING_STATUS_LABELS.keys()),
+            format_func=lambda k: FILING_STATUS_LABELS[k],
+            index=0,
         )
-        ordinary_rate = ordinary_rate_pct / 100.0
-        capgains_rate_pct = st.number_input(
-            "Long-term capital gains rate (%)",
-            min_value=0.0, max_value=25.0, value=15.0, step=0.5, format="%.1f",
-            help="Rate applied to the gains portion of Brokerage withdrawals. The gains fraction is computed per-holding from the Cost Basis column.",
+        state_options = list(STATE_NAMES.keys())
+        tax_state = st.selectbox(
+            "State",
+            options=state_options,
+            format_func=lambda k: f"{k} — {STATE_NAMES[k]}" if k != "None" else STATE_NAMES[k],
+            index=state_options.index("None"),
         )
-        capgains_rate = capgains_rate_pct / 100.0
+        spouse_65_plus = False
+        if filing_status == "married_joint" and int(current_age) >= 65:
+            spouse_65_plus = st.checkbox(
+                "Spouse is also 65 or older",
+                help="Adds an extra standard deduction for a qualifying spouse.",
+            )
+    tax_profile = TaxProfile(
+        filing_status=filing_status,
+        age=int(current_age),
+        state=tax_state if tax_state != "None" else None,
+        spouse_also_65_plus=spouse_65_plus,
+    )
     st.divider()
 
     # ── Advanced ──────────────────────────────────────────────────────────────
@@ -809,9 +809,16 @@ if run_clicked:
             # Convert after-tax spending goal → pre-tax portfolio withdrawal
             net_spend = annual_withdrawal  # may be None if finding SWR
             if net_spend is not None and (ticker_values or cash_total > 0):
-                gross_annual_withdrawal = _gross_withdrawal(
-                    net_spend, ticker_values or [], cash_total, account_types,
-                    basis_by_ticker, ordinary_rate, capgains_rate,
+                pretax_frac, brokerage_frac, gains_frac = _compute_portfolio_fracs(
+                    ticker_values or [], cash_total, account_types, basis_by_ticker,
+                )
+                gross_annual_withdrawal = gross_up_withdrawal(
+                    net_spending=net_spend,
+                    pretax_frac=pretax_frac,
+                    brokerage_frac=brokerage_frac,
+                    gains_frac=gains_frac,
+                    ss_annual=float(social_security),
+                    profile=tax_profile,
                 )
             else:
                 gross_annual_withdrawal = net_spend
@@ -878,6 +885,11 @@ if run_clicked:
             st.session_state.safe_withdrawal = safe_w
             st.session_state.target_success  = resolved_target
             st.session_state.cfg           = cfg
+            st.session_state.tax_profile   = tax_profile
+            st.session_state.portfolio_fracs = (
+                (pretax_frac, brokerage_frac, gains_frac)
+                if (ticker_values or cash_total > 0) else None
+            )
 
             status.update(label="✅ Simulation complete", state="complete")
 
@@ -903,6 +915,24 @@ if st.session_state.results is not None:
     t_succ   = st.session_state.target_success
     summary  = depletion_summary(results)
     p        = results.params
+
+    # ── After-tax SWR estimate ─────────────────────────────────────────────────
+    # Compute the after-tax spendable equivalent of the gross safe withdrawal.
+    _stored_profile = st.session_state.tax_profile
+    _stored_fracs   = st.session_state.portfolio_fracs
+
+    def _net_of_tax(gross_w: float) -> float:
+        """Estimate after-tax spendable from a gross portfolio withdrawal."""
+        if _stored_profile is None or _stored_fracs is None:
+            return gross_w
+        pf, bf, gf = _stored_fracs
+        net_draw  = max(0.0, gross_w - float(p.social_security))
+        ordinary  = pf * net_draw
+        ltcg      = gf * bf * net_draw
+        taxes     = compute_total_tax(ordinary, ltcg, float(p.social_security), _stored_profile)
+        return gross_w - taxes
+
+    net_safe_w = _net_of_tax(safe_w) if safe_w is not None else None
 
     # ── Summary metric cards ──────────────────────────────────────────────────
     st.subheader("Results")
@@ -941,12 +971,23 @@ if st.session_state.results is not None:
                 f"Safe Withdrawal ({t_succ * 100:.0f}%)"
                 if t_succ is not None else "Safe Withdrawal"
             )
-            st.metric(
-                label,
-                f"${safe_w:,.0f}/yr",
-                delta=f"{safe_w / p.initial_balance * 100:.2f}% SWR",
-                delta_color="off",
-            )
+            swr_pct = safe_w / p.initial_balance * 100
+            if net_safe_w is not None and _stored_profile is not None:
+                st.metric(
+                    label,
+                    f"${net_safe_w:,.0f}/yr after tax",
+                    delta=f"${safe_w:,.0f}/yr gross  ·  {swr_pct:.2f}% SWR",
+                    delta_color="off",
+                    help="After-tax spendable amount estimated using your tax profile. "
+                         "Gross = pre-tax portfolio withdrawal (+ SS) before income taxes.",
+                )
+            else:
+                st.metric(
+                    label,
+                    f"${safe_w:,.0f}/yr",
+                    delta=f"{swr_pct:.2f}% SWR",
+                    delta_color="off",
+                )
         else:
             st.metric("Annual Withdrawal", f"${p.annual_withdrawal:,.0f}/yr")
     with m4:

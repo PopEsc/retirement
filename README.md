@@ -54,10 +54,45 @@ The app opens automatically in your browser at `http://localhost:8501`.
 1. Select **Historical** or **Parametric** mode in the sidebar
 2. **Historical mode:** add your holdings (ticker, value, account type) in the Portfolio Holdings table, or import a `portfolio.json` file
 3. **Parametric mode:** enter your portfolio balance and stock/bond allocation in the sidebar
-4. Set your annual withdrawal amount and Social Security income
-5. Click **🚀 Run Simulation**
+4. Set your **annual spending goal** (after-tax dollars) and Social Security income
+5. Enter your **current age** and **life expectancy** — the simulation horizon is computed automatically
+6. Open **Tax settings** and select your filing status and state
+7. Click **🚀 Run Simulation**
+
+The simulator grosses up your spending goal to a pre-tax withdrawal using 2026 federal and state
+tax brackets, then shows both the gross safe-withdrawal rate and the estimated **after-tax
+spendable amount** in the results.
 
 Historical market data is cached locally in `.market_cache/` after the first download, so subsequent runs are fast.
+
+---
+
+## Tax engine
+
+The GUI uses actual 2026 tax brackets to compute how much you need to withdraw from your
+portfolio to meet your after-tax spending goal.
+
+**Federal taxes modelled:**
+- Ordinary income (TCJA brackets: 10/12/22/24/32/35/37%) for Traditional IRA/401k withdrawals
+- Long-term capital gains (0/15/20%) stacked on ordinary income per IRS Publication 550 thresholds
+- Net Investment Income Tax (3.8% NIIT) on investment income above the MAGI threshold
+- Social Security taxability (IRC §86) — up to 85% included in income based on provisional income
+- Additional standard deduction for taxpayers aged 65+ (and spouse if married filing jointly)
+
+**State taxes modelled:**
+- Brackets for all 50 states + D.C. (Tax Foundation 2026 data)
+- States with no income tax (AK, FL, NV, NH, SD, TN, TX, WY) produce zero state tax
+- Washington state capital-gains-only tax (7% above $278K, 9% above $1M) on brokerage gains
+- Utah flat-rate credit ($966 single / $1,932 MFJ) subtracted from computed state tax
+- Social Security exemption for states that do not tax SS benefits
+
+**Account-type mix:**
+- Traditional IRA / 401k withdrawals → ordinary income
+- Brokerage → capital gains on the (value − cost basis) / value fraction
+- Roth IRA / Roth 401k / After-Tax 401k → tax-free
+- Cash → return of principal, no gross-up
+
+Tax data is stored in `retirement_sim/tax_data.py` and updated annually.
 
 ---
 
@@ -217,7 +252,7 @@ Per-holding proxies in the JSON file take precedence over `--proxy`.
 
 | Option | Default | Description |
 |---|---|---|
-| `--years`, `-y` | `30` | Simulation horizon in years |
+| `--years`, `-y` | `30` | Simulation horizon in years (CLI only; GUI derives this from current age and life expectancy) |
 | `--simulations`, `-n` | `10000` | Number of Monte Carlo runs |
 | `--seed` | — | Random seed for reproducibility |
 
