@@ -4,7 +4,8 @@
       "Bash(python main.py --portfolio 1000000 --stocks 0.60 --withdrawal 60000 --social-security 24000 --years 30 --simulations 5000 --no-charts --seed 42)",
       "Bash(pip install:*)",
       "Bash(python main.py --portfolio 1000000 --stocks 0.60 --withdrawal 60000 --social-security 24000 --no-charts --seed 42)",
-      "Bash(python -m pytest tests/ -v)"
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -c \"from retirement_sim.tax_calculator import TaxProfile, gross_up_withdrawal, compute_federal_tax, compute_state_tax; print\\(''tax_calculator OK''\\)\")"
     ]
   }
 }

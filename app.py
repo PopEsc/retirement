@@ -806,13 +806,17 @@ if run_clicked:
                 st.session_state.account_groups = None
 
             # ── Tax gross-up ──────────────────────────────────────────────────
-            # Convert after-tax spending goal → pre-tax portfolio withdrawal
+            # Compute account-mix fractions whenever holdings are available.
+            # These are used both for gross-up (fixed withdrawal mode) and for
+            # the after-tax display (SWR mode).
             pretax_frac, brokerage_frac, gains_frac = 0.0, 0.0, 0.0
-            net_spend = annual_withdrawal  # may be None if finding SWR
-            if net_spend is not None and (ticker_values or cash_total > 0):
+            if ticker_values or cash_total > 0:
                 pretax_frac, brokerage_frac, gains_frac = _compute_portfolio_fracs(
                     ticker_values or [], cash_total, account_types, basis_by_ticker,
                 )
+
+            net_spend = annual_withdrawal  # may be None if finding SWR
+            if net_spend is not None:
                 gross_annual_withdrawal = gross_up_withdrawal(
                     net_spending=net_spend,
                     pretax_frac=pretax_frac,
@@ -973,7 +977,7 @@ if st.session_state.results is not None:
                 if t_succ is not None else "Safe Withdrawal"
             )
             swr_pct = safe_w / p.initial_balance * 100
-            if net_safe_w is not None and _stored_profile is not None:
+            if net_safe_w is not None and _stored_profile is not None and _stored_fracs is not None:
                 st.metric(
                     label,
                     f"${net_safe_w:,.0f}/yr after tax",
